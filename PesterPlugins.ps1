@@ -1,4 +1,7 @@
 $VerbosePreference = 'Continue'
+$objects = Get-Content $PSScriptRoot\Objects.cs | Out-String
+Add-Type -TypeDefinition $objects
+
 # setup 
 Get-Module Stack | Remove-Module -Force
 New-Module -Name Stack {
@@ -7,7 +10,7 @@ New-Module -Name Stack {
 
     function New-Scope ([string]$Name, [string]$Hint, [string]$Id = [Guid]::NewGuid().ToString('N')) { 
         Write-Verbose -Message "Creating new scope $Id - $Hint - $Name"
-        New-Object -TypeName PsObject -Property @{
+        New-Object -TypeName Pester.Scope -Property @{
             Id   = $Id
             Name = $Name
             Hint = $Hint
@@ -32,7 +35,7 @@ New-Module -Name Stack {
         }
     }
 
-    function Get-Parent {
+    function Get-ScopeParent {
         $s = $script:scopeStack.ToArray()[1]
         Write-Verbose -Message "Getting parent scope -> $($s.Id) - $($s.Hint) - $($s.Name)"
         $s
@@ -49,18 +52,18 @@ New-Module -Name Stack {
 function New-PesterPlugin {
     param (
         [String] $Name,
-        [String] $Version,
-        $DefaultConfig,
+        [Version] $Version,
+        [PSObject] $DefaultConfig,
         [ScriptBlock] $OneTimeSetup,
         [ScriptBlock] $BlockSetup,
         [ScriptBlock] $BlockTeardown,
         [ScriptBlock] $OneTimeTeardown
     )
 
-    New-Object -TypeName PSObject -Property @{
+    New-Object -TypeName 'Pester.Plugin' -Property @{
         Name            = $Name
         Version         = $Version
-        DefaultConfig          = $DefaultConfig
+        DefaultConfig   = $DefaultConfig
         OneTimeSetup    = $OneTimeSetup
         BlockSetup      = $BlockSetup
         BlockTeardown   = $BlockTeardown
@@ -120,26 +123,62 @@ function New-OutputPlugin {
         -BlockSetup $blockSetup
 }
 
-function New-PluginStepInvocation {
+function New-PluginStep {
     param(
-        $PluginName,        
-        $Step,
-        $ScriptBlock,
-        $State,
-        $PluginConfig,
-        $PesterConfig,
-        $Exception
+        [Pester.Plugin] $Plugin,        
+        [Pester.StepType] $Step,
+        [ScriptBlock]  $ScriptBlock
     )
 
-    New-Object -TypeName PSObject -Property @{
-        PluginName   = [String] $PluginName
-        Step         = [String] $Step
-        ScriptBlock  = [ScriptBlock] $ScriptBlock
-        State        = $State
-        PluginConfig = $PluginConfig
-        PesterConfig = $PesterConfig
-        Exception    = $Exception
+    New-Object -TypeName Pester.Step -Property @{
+        Plugin      = $Plugin
+        Step        = $Step
+        ScriptBlock = $ScriptBlock
     }
+}
+
+function Get-Plugin {
+    param (
+        [Parameter(Mandatory = $True)]
+        [Pester.Scope] $Scope
+    )
+
+    @($script:plugins[$Scope.Id])
+}
+
+function Load-PluginState {
+    param (
+        [Parameter(Mandatory = $True)]
+        [Pester.Scope] $Scope,
+        [Parameter(Mandatory = $True)]
+        [Pester.Plugin] $Plugin
+    )
+
+    $pluginState[($Scope.Id + "|" + $Plugin.Name)]
+}
+
+function Save-PluginState {
+    param (
+        [Parameter(Mandatory = $True)]
+        [Pester.Scope] $Scope,
+        [Parameter(Mandatory = $True)]
+        [Pester.Plugin] $Plugin,
+        [Parameter(Mandatory = $True)]
+        [PSObject] $State
+    )
+
+    $pluginState[($Scope.Id + "|" + $Plugin.Name)] = $State
+}
+
+function Test-PluginHasStep {
+    param(
+        [Parameter(Mandatory = $true)]
+        [Pester.Plugin] $Plugin,
+        [Parameter(Mandatory = $true)]
+        [Pester.StepType] $Step
+    ) 
+    
+    $null -ne $Plugin.$Step
 }
 
 function Invoke-Block {
@@ -149,26 +188,22 @@ function Invoke-Block {
         $ScriptBlock
     )
     Write-Verbose -Message "Running block '$Hint - $($Name)'"
-    $context = $scope = New-Scope -Name $Name -Hint $Hint
-    
+    $scope = New-Scope -Name $Name -Hint $Hint
     Push-Scope $scope
-    $id = $scope.Id
     
-    $parentId = (Get-Parent).Id
-    $plugins = $script:plugin[$parentId]
-   
+    
+    
+    $plugins = Get-Plugin -Scope $scope.Parent
     try {
         try {
-            $oneTimeSetups = $plugins | where { $_.OneTimeSetup } | foreach { New-PluginStepInvocation -PluginName $_.Name -State $script:state[$_.Name] -ScriptBlock $_.OneTimeSetup -Step "OneTimeSetup" -PluginConfig $_.DefaultConfig }
-            $s = Invoke-PluginStep -PluginStepInvocation $oneTimeSetups -Context $context
-            $s | foreach { $script:state[$_.PluginName] = $_.State } 
+            $Plugins | Invoke-Plugin -Step 'OneTimeSetup' | Assert-PluginStepSuccess
+
             try {
-                $blockSetups = $plugins | where { $_.BlockSetup} | foreach { New-PluginStepInvocation -PluginName $_.Name -State $script:state[$_.Name] -ScriptBlock $_.BlockSetup -Step "BlockSetup" -PluginConfig $_.DefaultConfig }
-                $s = Invoke-PluginStep -PluginStepInvocation $blockSetups -Context $context
-                $s | foreach { $script:state[$_.PluginName] = $_.State } 
+                $Plugins | Invoke-Plugin -Step 'BlockSetup' | Assert-PluginStepSuccess
+                
                 try {
                     # remove one time setups from the plugin
-                    $script:plugin[$id] = $plugins | foreach { New-PesterPlugin -Name $_.Name -Version $_.Version -BlockSetup $_.BlockSetup -BlockTeardown $_.BlockTeardown }
+                    Set-Plugin -Scope $scope = $plugins | foreach { New-PesterPlugin -Name $_.Name -Version $_.Version -BlockSetup $_.BlockSetup -BlockTeardown $_.BlockTeardown }
                     $null = & $ScriptBlock
                 }
                 finally {}
@@ -193,41 +228,94 @@ function Invoke-Block {
     }
 }
 
+function New-PluginStepResult {
+    param(
+        [Pester.Step] $Step,
+        [PSObject] $State,
+        [Management.Automation.ErrorRecord] $ErrorRecord
+    )
+
+    New-Object -TypeName Pester.StepResult -Property @{
+        Step        = $Step
+        State       = $State
+        ErrorRecord = $ErrorRecord
+    }   
+}
+
+function Assert-PluginStepSuccess {
+    param(
+        [Parameter(Mandatory = $true, ValueFromPipeline = $true)]
+        [Plugin.StepResult[]] $StepResult
+    )
+
+    $failed = @( $StepResult | where { $null -ne $_.ErrorRecord } )
+    $anyFailed = $failed.Count -ne 0
+    if ($anyFailed) {
+        throw "$($failed.Count) tasks failed "
+    }
+
+} 
+function Invoke-Plugin {
+    param(
+        [Parameter(Mandatory = $true, ValueFromPipeline = $true)]
+        [Pester.Plugin[]] $Plugin,
+        [Parameter(Mandatory = $true)]
+        [Pester.StepType] $Step,
+        [Parameter(Mandatory = $true)]
+        [Pester.Scope] $Scope
+    )
+
+    process {
+        if (-not (Test-PluginHasStep -Plugin $Plugin -Step $Step)) {
+            return
+        }
+    
+        $step = New-PluginStep -Plugin $Plugin -Step $Step -ScriptBlock $Plugin.$Step
+        $pluginState = Load-PluginState -PluginName $Plugin.Name -Scope $Scope.Parent
+
+        $newState = Invoke-PluginStep `
+            -Step $step `
+            -PluginConfig $Plugin.DefaultConfig `
+            -PluginState $pluginState `
+            -Scope $Scope
+
+        Save-PluginState -ScopeId $id -PluginName $Plugin.Name -State $newState
+    }
+}
+
 function Invoke-PluginStep {
     param (
-        [PSObject[]]$PluginStepInvocation,
-        $Context
+        [Parameter(Mandatory = $true)]
+        [Pester.PluginStep] $Step,
+        [Parameter(Mandatory = $true)]
+        [PSObject] $PluginConfig,
+        [Parameter(Mandatory = $true)]
+        [PSObject] $PluginState,
+        [Parameter(Mandatory = $true)]
+        [Pester.Scope] $Scope
     )
-    $run = foreach ($s in $PluginStepInvocation) {
-        $result = $null
-        $err = $null
-        # pipelining stuff we don't need this yet, and might not need it at all
-        # $state = New-Object -TypeName PSObject -Property @{ AnyFailed = [bool]$err.Count; <# CallNext = $true #>}
-        try {
-            do {
-                # let's not do anything with the output for the moment
-                $result = &($s.ScriptBlock) $s.State $Context $s.PluginConfig
-            }
-            until ($true)
+
+    $output = $null
+    $err = $null
+    # pipelining stuff we don't need this yet, and might not need it at all
+    # $state = New-Object -TypeName PSObject -Property @{ AnyFailed = [bool]$err.Count; <# CallNext = $true #>}
+    try {
+        do {
+            $output = &($s.ScriptBlock) $s.State $Context $s.PluginConfig
+        }
+        until ($true)
    
-            # shortcutting the circle might not be needed
-            # if (-not $state.callNext) {
-            #     Write-Verbose "ScriptBlock $ScriptBlock stopped the execution by setting CallNext to `$false."
-            #     break
-            # }
-        }
-        catch {
-            $err = $_
-        }
-
-        New-PluginStepInvocation -PluginName $s.PluginName -Step $s.Step -ScripBlock $s.ScriptBlock -State $result -Exception $err    
+        # shortcutting the circle might not be needed
+        # if (-not $state.callNext) {
+        #     Write-Verbose "ScriptBlock $ScriptBlock stopped the execution by setting CallNext to `$false."
+        #     break
+        # }
+    }
+    catch {
+        $err = $_
     }
 
-    $failed = @($run | where { $null -ne $_.Exception })
-    if (0 -ne $failed.Count) {
-        throw  "" + $failed.Count + " tasks failed"
-    }
-    $run
+    New-PluginStepResult -Step $Step -State $output -ErrorRecord $err
 }
 
 # Invoke-Block `
@@ -241,13 +329,13 @@ function Invoke-PluginStep {
 #     -BlockTeardown { Write-Host "fmw teardown every time" }, { Write-Host "fmw teardown every time" }`
 #     -OneTimeTeardown { Write-Host "fmw teardown one time" }, { Write-Host "fmw teardown one time" }
 
-$script:plugin = @{}
+$script:plugins = @{}
 $scope = New-Scope -Hint "top"
 Push-Scope $scope
 $id = $scope.Id
 
-[PSObject[]] $p = (New-OutputPlugin), (New-TestDrivePlugin)
-$script:plugin[$id] = $p
+[PSObject[]] $Plugin = (New-OutputPlugin), (New-TestDrivePlugin)
+$script:plugins[$id] = $Plugin
 $script:state = @{}
 
 Invoke-Block -Name "a" -Hint "describe" -ScriptBlock {
@@ -257,4 +345,3 @@ Invoke-Block -Name "a" -Hint "describe" -ScriptBlock {
         write-host "tests" 
     }
 }
-
