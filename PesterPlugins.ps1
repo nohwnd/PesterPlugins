@@ -1,6 +1,8 @@
-$VerbosePreference = 'Continue'
+# $VerbosePreference = 'Continue'
+$VerbosePreference = 'SilentlyContinue'
 $objects = Get-Content $PSScriptRoot\Objects.cs | Out-String
 Add-Type -TypeDefinition $objects
+
 
 # setup 
 Get-Module Stack | Remove-Module -Force
@@ -17,9 +19,12 @@ New-Module -Name Stack {
         }
     }
 
-    function Push-Scope ($Scope) {
+    function Push-Scope ($Name, $Hint) {
+        $scope = New-Scope -Name $Name -Hint $Hint
+        $scope.Parent = Get-Scope
         $script:scopeStack.Push($Scope)
         Write-Verbose -Message "Pushed scope $($Scope.Id) - $($Scope.Hint) - $($Scope.Name)"
+        $Scope
     }
     
     function Pop-Scope {
@@ -28,17 +33,15 @@ New-Module -Name Stack {
     }
 
     function Get-Scope ($Scope = 0) {
+        if ($script:scopeStack.Count -eq 0) { 
+            return $null
+        }
+        
         if ($Scope -eq 0) {
             $s = $script:scopeStack.Peek()
             Write-Verbose -Message "Getting scope $Scope -> $($s.Id) - $($s.Hint) - $($s.Name)"
             $s
         }
-    }
-
-    function Get-ScopeParent {
-        $s = $script:scopeStack.ToArray()[1]
-        Write-Verbose -Message "Getting parent scope -> $($s.Id) - $($s.Hint) - $($s.Name)"
-        $s
     }
 
     function Get-ScopeHistory {
@@ -49,6 +52,7 @@ New-Module -Name Stack {
 } | Import-Module -Force
 #
 
+$script:stepResults = @{}
 function New-PesterPlugin {
     param (
         [String] $Name,
@@ -71,6 +75,278 @@ function New-PesterPlugin {
     }
 }
 
+function New-Step {
+    param(
+        [Pester.Plugin] $Plugin,        
+        [Pester.StepType] $StepType,
+        [ScriptBlock]  $ScriptBlock
+    )
+
+    New-Object -TypeName Pester.Step -Property @{
+        Plugin      = $Plugin
+        StepType    = $StepType
+        ScriptBlock = $ScriptBlock
+    }
+}
+
+function Get-Plugin {
+    @($script:plugins)
+}
+
+function Load-StepResult {
+    param (
+        [Parameter(Mandatory = $True)]
+        [Pester.Scope] $Scope,
+        [Parameter(Mandatory = $True)]
+        [Pester.Plugin] $Plugin
+    )
+
+    $script:stepResults[($Plugin.Name + "|" + $Scope.Id)]
+}
+
+function Save-StepResult {
+    param (
+        [Parameter(Mandatory = $True)]
+        [Pester.Scope] $Scope,
+        [Parameter(Mandatory = $True)]
+        [Pester.Plugin] $Plugin,
+        [Pester.StepResult] $StepResult
+    )
+
+    $script:stepResults[($Plugin.Name + "|" + $Scope.Id)] = $StepResult
+}
+
+function Test-PluginHasStep {
+    param(
+        [Parameter(Mandatory = $true)]
+        [Pester.Plugin] $Plugin,
+        [Parameter(Mandatory = $true)]
+        [Pester.StepType] $StepType
+    ) 
+    
+    $null -ne $Plugin.$StepType
+}
+
+function Invoke-Block {
+    param (
+        $Name,
+        $Hint,
+        $ScriptBlock
+    )
+
+    $blockSetupSuccess = $false
+
+    $isTopLevelScope = $null -eq $scope.Parent
+    $oneTimeSetupSuccess = $false    
+
+    Write-Verbose -Message "Running block '$Hint - $($Name)'"
+    $scope = Push-Scope -Name $Name -Hint $Hint
+    try {
+
+        $plugins = Get-Plugin
+        try {
+            if ($isTopLevelScope) {
+                Write-Verbose -Message "Running one time setup"
+                $plugins | Invoke-Plugin -Step 'OneTimeSetup' -Scope $scope | Assert-StepSuccess
+                Write-Verbose -Message "One time setup succeeded"
+                $oneTimeSetupSuccess = $true
+            }
+
+            try {
+                Write-Verbose -Message "Running block setup"
+                $plugins | Invoke-Plugin -Step 'BlockSetup' -Scope $scope | Assert-StepSuccess
+                Write-Verbose -Message "Block setup succeeded"
+                $blockSetupSuccess = $true
+                
+                try {
+                    Write-Verbose -Message "Running script block"
+                    do {
+                        $null = & $ScriptBlock
+                    }
+                    until ($true)
+                    Write-Verbose -Message "Script block success"
+                }
+                finally {}
+            }
+            finally {
+                if (-not $blockSetupSuccess) {
+                    Write-Verbose -Message "Block setup failed"    
+                }
+                Write-Verbose -Message "Running block teardown"
+                $plugins | Invoke-Plugin -Step 'BlockTeardown' -Scope $scope | Assert-StepSuccess
+                Write-Verbose -Message "Block teardown success"
+            }
+        }
+        finally {
+            if ($isTopLevelScope) {
+                if (-not $oneTimeSetupSuccess) {
+                    Write-Verbose -Message "Block setup failed"    
+                }
+                Write-Verbose -Message "Running one time teardown"
+                $plugins | Invoke-Plugin -Step 'OneTimeTeardown' -Scope $scope | Assert-StepSuccess
+                Write-Verbose -Message "One time teardown success"
+            }
+        }
+    }
+    catch {
+        # Write-Host ($_ | Fl -Force * | Out-String)
+        throw $_
+    }
+    finally {
+        $null = Pop-Scope
+    }
+}
+
+function New-StepResult {
+    param(
+        [Pester.Step] $Step,
+        [PSObject] $State,
+        [Management.Automation.ErrorRecord] $ErrorRecord
+    )
+    
+    New-Object -TypeName Pester.StepResult -Property @{
+        Step        = $Step
+        State       = $State
+        ErrorRecord = $ErrorRecord
+        Success     = $null -eq $ErrorRecord
+    }   
+}
+
+function Assert-StepSuccess {
+    param(
+        [Parameter(Mandatory = $true, ValueFromPipeline = $true)]
+        [Pester.StepResult] $StepResult
+    )
+
+    begin {
+        $results = @()
+    }
+    process {
+        $results += $StepResult
+    }
+    end {
+        $count = $results.Count
+        $pluginNames = ($results | Select -ExpandProperty Step | Select -ExpandProperty Plugin | Select -ExpandProperty Name) -join ', '
+        $stepName = $results | Select -ExpandProperty Step | Select -ExpandProperty StepType | Sort-Object -Unique
+        Write-Verbose -Message "Ensuring step $stepName passed, from $count plugins: $pluginNames"
+        $failed = @( $results | where { $null -ne $_.ErrorRecord } )
+        $anyFailed = $failed.Count -ne 0
+        if ($anyFailed) {
+            $m = $failed | foreach { 
+                $_.Step.Plugin.Name
+                $_.Step.StepType
+                $_.ErrorRecord | Format-List -Force * | Out-String
+                "`n"
+            }
+
+            throw "$($failed.Count) tasks failed - `n $m"
+        }
+    }
+} 
+function Invoke-Plugin {
+    param(
+        [Parameter(Mandatory = $true, ValueFromPipeline = $true)]
+        [Pester.Plugin] $Plugin,
+        [Parameter(Mandatory = $true)]
+        [Pester.StepType] $StepType,
+        [Parameter(Mandatory = $true)]
+        [Pester.Scope] $Scope
+    )
+
+    process {
+        if (-not (Test-PluginHasStep -Plugin $Plugin -StepType $StepType)) {
+            return
+        }
+    
+        $step = New-Step -Plugin $Plugin -StepType $StepType -ScriptBlock $Plugin.$StepType
+                
+        $previousStepResult = Load-StepResult -Plugin $Plugin -Scope $scope
+        $isSetupStep = ($StepType -eq 'OneTimeSetup') -or ($StepType -eq 'BlockSetup')
+        $hasPreviousStepResult = $null -ne $previousStepResult
+        if (-not $hasPreviousStepResult) {
+            if ($isSetupStep) {
+                $previousStepResult = Load-StepResult -Plugin $Plugin -Scope $Scope.Parent
+            }
+        }
+
+        $previousResultIsStillNull = $null -eq $previousStepResult 
+        if ($previousResultIsStillNull) { 
+            $previousStepResult = New-StepResult -Step $Step -State $null -ErrorRecord $null
+        }
+        
+        $newStepResult = Invoke-PluginStep `
+            -Step $step `
+            -Scope $Scope `
+            -PluginConfig $Plugin.DefaultConfig `
+            -StepResult $previousStepResult
+
+        Save-StepResult -Scope $Scope -Plugin $Plugin -StepResult $newStepResult
+
+        $newStepResult
+    }
+}
+
+function Invoke-PluginStep {
+    param (
+        [Parameter(Mandatory = $true)]
+        [Pester.Step] $Step,
+        [Parameter(Mandatory = $true)]
+        [Pester.Scope] $Scope,
+        [Parameter(Mandatory = $true)]
+        [PSObject] $PluginConfig,
+        [Pester.StepResult] $StepResult
+    )
+
+    $output = $null
+    $err = $null
+    # pipelining stuff we don't need this yet, and might not need it at all
+    # $state = New-Object -TypeName PSObject -Property @{ AnyFailed = [bool]$err.Count; <# CallNext = $true #>}
+    try {
+        do {
+            # param($Step, $State, $Config, $Pester, $SetupResult)
+            #todo: replace scope with Pester invocation
+            $output = &($Step.ScriptBlock) $Step $StepResult.State $PluginConfig $Scope $StepResult
+        }
+        until ($true)
+   
+        # shortcutting the circle might not be needed
+        # if (-not $state.callNext) {
+        #     Write-Verbose "ScriptBlock $ScriptBlock stopped the execution by setting CallNext to `$false."
+        #     break
+        # }
+    }
+    catch {
+        $err = $_
+    }
+
+    New-StepResult -Step $Step -State $output -ErrorRecord $err
+}
+
+function ConvertTo-Object {
+    param (
+        [Parameter(Mandatory = $true)]
+        [Type] $Type, 
+        [Parameter(Mandatory = $true, ValueFromPipeline = $true)]
+        [PSObject] $InputObject
+    )
+    $properties = $InputObject.PSObject.Properties | foreach -Begin { $h = @{} } -Process {$h.Add($_.Name, $_.Value) } -End {$h}
+    New-Object -TypeName $Type.FullName -Property $properties
+}
+
+# Invoke-Block `
+#     -OneTimeSetup { Write-Host "fmw setup one time" }, { Write-Host "fmw setup one time" }`
+#     -BlockSetup { Write-Host "fmw setup every time" }, { Write-Host "fmw setup every time" }`
+#     -TestSetupOneTime { Write-Host "test setup one time" }, { Write-Host "test setup one time" }`
+#     -TestSetupEveryTime { Write-Host "test setup every time" }, { Write-Host "test setup every time" }`
+#     -Test { Write-Host "test" }`
+#     -TestTeardownEveryTime { Write-Host "test teardown every time" }, { Write-Host "test teardown every time" }`
+#     -TestTeardownOneTime { Write-Host "test teardown one time" }, { Write-Host "test teardown one time" }`
+#     -BlockTeardown { Write-Host "fmw teardown every time" }, { Write-Host "fmw teardown every time" }`
+#     -OneTimeTeardown { Write-Host "fmw teardown one time" }, { Write-Host "fmw teardown one time" }
+
+
+# -----------------------------------------
+
 # function New-TestDrivePlugin {
 #     $oneTimeSetup = { New-TestDrive }
 #     $blockSetup = { $TestDriveContent = Get-TestDriveChildItem }
@@ -85,28 +361,52 @@ function New-PesterPlugin {
 #         -OneTimeTeardown $oneTimeTeardown
 # }
 
+
 function New-TestDrivePlugin {
-    $oneTimeSetup = { param($State, $Context) Write-Host "New-TestDrive in $($Context)"  }
-    $blockSetup = { Write-host "settings state to a,b,1" ; "a", "b", 1 }
-    $blockTeardown = { param($State, $Context) Write-Host "teardown '$($State | Out-String)'" }
-    $oneTimeTeardown = { "removing test drive" }
+    $oneTimeSetup = { param($Step, $State, $Config, $Pester) 
+        $Config = $Config | ConvertTo-Object -Type ([Pester.TestDriveConfig])
+        Write-Host "Create test drive in $($Config.Path)"  
+    }
+    $blockSetup = { param($Step, $State, $Config, $Pester) Write-host "settings state to a,b,1" ; "a", "b", 1 }
+    $blockTeardown = { param($Step, $State, $Config, $Pester, $SetupResult) Write-Host "teardown '$($State | Out-String)'" }
+    $oneTimeTeardown = { param($Step, $State, $Config, $Pester, $SetupResult) Write-Host "Teardown test drive in $($Config.Path)" }
 
     New-PesterPlugin -Name "TestDrive" `
         -Version "0.1.0" `
         -OneTimeSetup $oneTimeSetup `
         -BlockSetup $blockSetup `
         -BlockTeardown $blockTeardown `
-        -OneTimeTeardown $oneTimeTeardown ` 
+        -OneTimeTeardown $oneTimeTeardown `
+        -DefaultConfig ([PSCustomObject]@{Path = (Join-Path -Path $env:Temp -ChildPath ([Guid]::NewGuid().ToString("N"))) })
 }
 
 function New-OutputPlugin {
     $oneTimeSetup = { 
-        param($State, $Context, $PluginConfig, $PesterConfig) 
-        Write-Host -ForegroundColor $PluginConfig.HeaderColor "Running all tests in $($Context.RootPath)" 
+        param($Step, $State, $Config, $Pester) 
+        Write-Host -ForegroundColor $Config.HeaderColor "Running all tests in $($Pester.RootPath)" 
+        $State + 1
     }
+
     $blockSetup = { 
-        param($State, $Context, $PluginConfig, $PesterConfig) 
-        Write-Host -ForegroundColor $PluginConfig.BlockColor "$($PluginConfig.Margin * $State)$($Context.Hint) - $($Context.Name)"
+        param($Step, $State, $Config, $Pester)
+
+        Write-Host -ForegroundColor $Config.BlockColor "$($Config.Margin * $State)$($Pester.Hint) - $($Pester.Name) {"
+        $State + 1
+    }
+
+    $blockTeardown = {
+        param($Step, $State, $Config, $Pester, $SetupResult)
+        if (-not $SetupResult.Success) {
+            return
+        }
+        $margin = $State - 1
+        Write-Host -ForegroundColor $Config.BlockColor "$($Config.Margin * $margin)}"
+        $margin
+    }
+
+    $oneTimeTeardown = {
+        param($Step, $State, $Config, $Pester, $SetupResult)
+        Write-Host -ForegroundColor $Config.HeaderColor "Test summary"
     }
 
     $defaultConfig = New-Object -TypeName PSObject -Property @{
@@ -120,227 +420,40 @@ function New-OutputPlugin {
         -Version "0.1.0" `
         -DefaultConfig $defaultConfig `
         -OneTimeSetup $oneTimeSetup `
-        -BlockSetup $blockSetup
+        -BlockSetup $blockSetup `
+        -BlockTeardown $blockTeardown `
+        -OneTimeTeardown $oneTimeTeardown
 }
 
-function New-PluginStep {
-    param(
-        [Pester.Plugin] $Plugin,        
-        [Pester.StepType] $Step,
-        [ScriptBlock]  $ScriptBlock
-    )
 
-    New-Object -TypeName Pester.Step -Property @{
-        Plugin      = $Plugin
-        Step        = $Step
-        ScriptBlock = $ScriptBlock
-    }
-}
+# -----------------------------------------
 
-function Get-Plugin {
-    param (
-        [Parameter(Mandatory = $True)]
-        [Pester.Scope] $Scope
-    )
 
-    @($script:plugins[$Scope.Id])
-}
+[Pester.Plugin[]] $script:plugins = @((New-OutputPlugin), (New-TestDrivePlugin)) 
 
-function Load-PluginState {
-    param (
-        [Parameter(Mandatory = $True)]
-        [Pester.Scope] $Scope,
-        [Parameter(Mandatory = $True)]
-        [Pester.Plugin] $Plugin
-    )
 
-    $pluginState[($Scope.Id + "|" + $Plugin.Name)]
-}
-
-function Save-PluginState {
-    param (
-        [Parameter(Mandatory = $True)]
-        [Pester.Scope] $Scope,
-        [Parameter(Mandatory = $True)]
-        [Pester.Plugin] $Plugin,
-        [Parameter(Mandatory = $True)]
-        [PSObject] $State
-    )
-
-    $pluginState[($Scope.Id + "|" + $Plugin.Name)] = $State
-}
-
-function Test-PluginHasStep {
-    param(
-        [Parameter(Mandatory = $true)]
-        [Pester.Plugin] $Plugin,
-        [Parameter(Mandatory = $true)]
-        [Pester.StepType] $Step
-    ) 
-    
-    $null -ne $Plugin.$Step
-}
-
-function Invoke-Block {
-    param (
-        $Name,
-        $Hint,
-        $ScriptBlock
-    )
-    Write-Verbose -Message "Running block '$Hint - $($Name)'"
-    $scope = New-Scope -Name $Name -Hint $Hint
-    Push-Scope $scope
-    
-    
-    
-    $plugins = Get-Plugin -Scope $scope.Parent
-    try {
-        try {
-            $Plugins | Invoke-Plugin -Step 'OneTimeSetup' | Assert-PluginStepSuccess
-
-            try {
-                $Plugins | Invoke-Plugin -Step 'BlockSetup' | Assert-PluginStepSuccess
-                
-                try {
-                    # remove one time setups from the plugin
-                    Set-Plugin -Scope $scope = $plugins | foreach { New-PesterPlugin -Name $_.Name -Version $_.Version -BlockSetup $_.BlockSetup -BlockTeardown $_.BlockTeardown }
-                    $null = & $ScriptBlock
-                }
-                finally {}
-            }
-            finally {
-                $blockSetups = $plugins | where { $_.BlockTeardown } | foreach { New-PluginStepInvocation -PluginName $_.Name -State $script:state[$_.Name] -ScriptBlock $_.BlockTeardown -Step "BlockTeardown" -PluginConfig $_.DefaultConfig }
-                $s = Invoke-PluginStep -PluginStepInvocation $blockSetups -Context $context
-                $s | foreach { $script:state[$_.PluginName] = $_.State } 
-            }
-        }
-        finally {
-            $blockSetups = $plugins | where { $_.OneTimeTeardown } | foreach { New-PluginStepInvocation -PluginName $_.Name -State $script:state[$_.Name] -ScriptBlock $_.OneTimeTeardown -Step "OneTimeTeardown" -PluginConfig $_.DefaultConfig }
-            $s = Invoke-PluginStep -PluginStepInvocation $blockSetups -Context $context
-            $s | foreach { $script:state[$_.PluginName] = $_.State } 
-        }
-    }
-    catch {
-        throw $_
-    }
-    finally {
-        $null = Pop-Scope
-    }
-}
-
-function New-PluginStepResult {
-    param(
-        [Pester.Step] $Step,
-        [PSObject] $State,
-        [Management.Automation.ErrorRecord] $ErrorRecord
-    )
-
-    New-Object -TypeName Pester.StepResult -Property @{
-        Step        = $Step
-        State       = $State
-        ErrorRecord = $ErrorRecord
-    }   
-}
-
-function Assert-PluginStepSuccess {
-    param(
-        [Parameter(Mandatory = $true, ValueFromPipeline = $true)]
-        [Plugin.StepResult[]] $StepResult
-    )
-
-    $failed = @( $StepResult | where { $null -ne $_.ErrorRecord } )
-    $anyFailed = $failed.Count -ne 0
-    if ($anyFailed) {
-        throw "$($failed.Count) tasks failed "
-    }
-
-} 
-function Invoke-Plugin {
-    param(
-        [Parameter(Mandatory = $true, ValueFromPipeline = $true)]
-        [Pester.Plugin[]] $Plugin,
-        [Parameter(Mandatory = $true)]
-        [Pester.StepType] $Step,
-        [Parameter(Mandatory = $true)]
-        [Pester.Scope] $Scope
-    )
-
-    process {
-        if (-not (Test-PluginHasStep -Plugin $Plugin -Step $Step)) {
-            return
-        }
-    
-        $step = New-PluginStep -Plugin $Plugin -Step $Step -ScriptBlock $Plugin.$Step
-        $pluginState = Load-PluginState -PluginName $Plugin.Name -Scope $Scope.Parent
-
-        $newState = Invoke-PluginStep `
-            -Step $step `
-            -PluginConfig $Plugin.DefaultConfig `
-            -PluginState $pluginState `
-            -Scope $Scope
-
-        Save-PluginState -ScopeId $id -PluginName $Plugin.Name -State $newState
-    }
-}
-
-function Invoke-PluginStep {
-    param (
-        [Parameter(Mandatory = $true)]
-        [Pester.PluginStep] $Step,
-        [Parameter(Mandatory = $true)]
-        [PSObject] $PluginConfig,
-        [Parameter(Mandatory = $true)]
-        [PSObject] $PluginState,
-        [Parameter(Mandatory = $true)]
-        [Pester.Scope] $Scope
-    )
-
-    $output = $null
-    $err = $null
-    # pipelining stuff we don't need this yet, and might not need it at all
-    # $state = New-Object -TypeName PSObject -Property @{ AnyFailed = [bool]$err.Count; <# CallNext = $true #>}
-    try {
-        do {
-            $output = &($s.ScriptBlock) $s.State $Context $s.PluginConfig
-        }
-        until ($true)
-   
-        # shortcutting the circle might not be needed
-        # if (-not $state.callNext) {
-        #     Write-Verbose "ScriptBlock $ScriptBlock stopped the execution by setting CallNext to `$false."
-        #     break
-        # }
-    }
-    catch {
-        $err = $_
-    }
-
-    New-PluginStepResult -Step $Step -State $output -ErrorRecord $err
-}
-
-# Invoke-Block `
-#     -OneTimeSetup { Write-Host "fmw setup one time" }, { Write-Host "fmw setup one time" }`
-#     -BlockSetup { Write-Host "fmw setup every time" }, { Write-Host "fmw setup every time" }`
-#     -TestSetupOneTime { Write-Host "test setup one time" }, { Write-Host "test setup one time" }`
-#     -TestSetupEveryTime { Write-Host "test setup every time" }, { Write-Host "test setup every time" }`
-#     -Test { Write-Host "test" }`
-#     -TestTeardownEveryTime { Write-Host "test teardown every time" }, { Write-Host "test teardown every time" }`
-#     -TestTeardownOneTime { Write-Host "test teardown one time" }, { Write-Host "test teardown one time" }`
-#     -BlockTeardown { Write-Host "fmw teardown every time" }, { Write-Host "fmw teardown every time" }`
-#     -OneTimeTeardown { Write-Host "fmw teardown one time" }, { Write-Host "fmw teardown one time" }
-
-$script:plugins = @{}
-$scope = New-Scope -Hint "top"
-Push-Scope $scope
-$id = $scope.Id
-
-[PSObject[]] $Plugin = (New-OutputPlugin), (New-TestDrivePlugin)
-$script:plugins[$id] = $Plugin
-$script:state = @{}
+Push-Scope -Hint 'top' | Out-Null
 
 Invoke-Block -Name "a" -Hint "describe" -ScriptBlock {
-  
-    Write-host "Sb" 
+    Invoke-Block -Name "b" -Hint "context" -ScriptBlock { 
+        write-host "tests" 
+    }
+
+    Invoke-Block -Name "b" -Hint "context" -ScriptBlock { 
+        
+        Invoke-Block -Name "b" -Hint "context" -ScriptBlock {
+            Invoke-Block -Name "b" -Hint "context" -ScriptBlock {  
+                Invoke-Block -Name "b" -Hint "context" -ScriptBlock { 
+                    Invoke-Block -Name "b" -Hint "context" -ScriptBlock { 
+                        Write-host "tests"
+                    }        
+                }        
+            }
+        
+        }
+            
+    }
+
     Invoke-Block -Name "b" -Hint "context" -ScriptBlock { 
         write-host "tests" 
     }

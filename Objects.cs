@@ -6,6 +6,7 @@ namespace Pester {
         public string Id;
         public string Name;
         public string Hint;
+        public Scope Parent;
     }
     
     public class Plugin {
@@ -27,15 +28,24 @@ namespace Pester {
 
     public class Step { 
         public Plugin Plugin;
-        public StepType Step;
+        public StepType StepType;
         public ScriptBlock ScriptBlock;
-        public PSObject State;
-        public Step Parent;
     }
 
-    public class StepResult { 
+    public class StepResult {
+        public bool Success; 
         public Step Step;
         public PSObject State;
-        public ErrorRecord Error;
+        public ErrorRecord ErrorRecord;
+    }
+
+    public class PesterInvocation { 
+        public string RootPath;
+        public Scope Block;
+    }
+
+
+    public class TestDriveConfig { 
+        public string Path;
     }
 }
